@@ -1,0 +1,228 @@
+#!/usr/bin/env Rscript
+
+# Interactive + robust LOTUS (LNPN) online fetch:
+# - File picker for input CSV
+# - Reads a column named InChIKey / InChIkey / inchikey (case-insensitive)
+# - Queries LNPN API: /api/search/simple?query=<InChIKey>
+# - Extracts NPClassifier: Pathway / Superclass / Class
+# - Saves output next to input file
+
+suppressPackageStartupMessages({
+  library(tcltk)
+  library(readr)
+  library(dplyr)
+  library(httr)
+  library(jsonlite)
+  library(stringr)
+  library(tools)
+})
+
+LNPN_BASE <- "https://lotus.naturalproducts.net"
+LNPN_SIMPLE_ENDPOINT <- function(query) {
+  # API endpoint documented/used publicly:
+  # https://lotus.naturalproducts.net/api/search/simple?query=<...>
+  paste0(LNPN_BASE, "/api/search/simple?query=", URLencode(query, reserved = TRUE))
+}
+
+iso_datetime_now <- function() {
+  format(as.POSIXct(Sys.time(), tz = "UTC"), "%Y-%m-%dT%H:%M:%SZ")
+}
+
+pick_input_file <- function() {
+  f <- tcltk::tk_choose.files(
+    caption = "Select input CSV",
+    multi = FALSE,
+    filters = matrix(c("CSV files", ".csv", "All files", ".*"), ncol = 2, byrow = TRUE)
+  )
+  f <- as.character(f)
+  if (length(f) == 0 || is.na(f) || f == "") stop("No file selected.")
+  if (!file.exists(f)) stop(paste("File not found:", f))
+  f
+}
+
+find_inchikey_column <- function(df) {
+  # Accept: InChIKey, InChIkey, inchikey, etc.
+  nms <- names(df)
+  idx <- which(tolower(nms) == "inchikey")
+  if (length(idx) == 0) stop("No InChIKey column found (expected a column named like 'InChIKey' / 'InChIkey').")
+  nms[[idx[[1]]]]
+}
+
+normalize_inchikey <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[x == "" | is.na(x)] <- NA_character_
+  x
+}
+
+safe_get_json <- function(url, retries = 4, backoff = 1.4, timeout_s = 30) {
+  last_err <- NULL
+  for (i in seq_len(retries)) {
+    resp <- try(
+      GET(
+        url,
+        timeout(timeout_s),
+        user_agent("lotus-npclassifier-fetcher/1.0 (R; contact: none)")
+      ),
+      silent = TRUE
+    )
+    
+    if (!inherits(resp, "try-error")) {
+      sc <- status_code(resp)
+      
+      # Handle rate limiting / transient server issues
+      if (sc == 429 || (sc >= 500 && sc < 600)) {
+        last_err <- paste("HTTP", sc, "(retryable)")
+      } else if (sc >= 200 && sc < 300) {
+        txt <- content(resp, as = "text", encoding = "UTF-8")
+        return(fromJSON(txt, simplifyVector = FALSE))
+      } else {
+        last_err <- paste("HTTP", sc, "(non-retryable)")
+        break
+      }
+    } else {
+      last_err <- as.character(resp)
+    }
+    
+    Sys.sleep(backoff ^ i)
+  }
+  
+  return(list(.error = last_err, .url = url))
+}
+
+# LNPN responses can vary: naturalProducts can be a struct or list.
+# We extract the FIRST natural product hit.
+extract_first_natural_product <- function(js) {
+  if (is.null(js$naturalProducts)) return(NULL)
+  
+  np <- js$naturalProducts
+  
+  # If it's a list of hits, take first element
+  if (is.list(np) && !is.null(names(np))) {
+    # sometimes it is a single named list (a struct)
+    return(np)
+  }
+  
+  if (is.list(np) && length(np) >= 1) {
+    return(np[[1]])
+  }
+  
+  NULL
+}
+
+extract_npclassifier <- function(np_hit) {
+  if (is.null(np_hit)) {
+    return(list(pathway = NA_character_, superclass = NA_character_, class = NA_character_))
+  }
+  
+  pathway <- np_hit$chemicalTaxonomyNPclassifierPathway
+  superclass <- np_hit$chemicalTaxonomyNPclassifierSuperclass
+  clazz <- np_hit$chemicalTaxonomyNPclassifierClass
+  
+  pathway <- if (!is.null(pathway)) as.character(pathway) else NA_character_
+  superclass <- if (!is.null(superclass)) as.character(superclass) else NA_character_
+  clazz <- if (!is.null(clazz)) as.character(clazz) else NA_character_
+  
+  list(pathway = pathway, superclass = superclass, class = clazz)
+}
+
+fetch_lotus_npclassifier_for_inchikey <- function(inchikey, sleep_s = 0.2) {
+  inchikey <- normalize_inchikey(inchikey)
+  if (is.na(inchikey)) {
+    return(list(pathway = NA_character_, superclass = NA_character_, class = NA_character_,
+                lotus_lotus_id = NA_character_, lotus_wikidata_id = NA_character_,
+                lotus_hit = FALSE, lotus_error = NA_character_))
+  }
+  
+  url <- LNPN_SIMPLE_ENDPOINT(inchikey)
+  js <- safe_get_json(url)
+  
+  # If error object
+  if (!is.null(js$.error)) {
+    Sys.sleep(sleep_s)
+    return(list(pathway = NA_character_, superclass = NA_character_, class = NA_character_,
+                lotus_lotus_id = NA_character_, lotus_wikidata_id = NA_character_,
+                lotus_hit = FALSE, lotus_error = paste(js$.error)))
+  }
+  
+  np_hit <- extract_first_natural_product(js)
+  npc <- extract_npclassifier(np_hit)
+  
+  lotus_id <- if (!is.null(np_hit$lotus_id)) as.character(np_hit$lotus_id) else NA_character_
+  wikidata_id <- if (!is.null(np_hit$wikidata_id)) as.character(np_hit$wikidata_id) else NA_character_
+  
+  hit <- !(is.na(npc$pathway) && is.na(npc$superclass) && is.na(npc$class))
+  
+  Sys.sleep(sleep_s)
+  list(pathway = npc$pathway, superclass = npc$superclass, class = npc$class,
+       lotus_lotus_id = lotus_id, lotus_wikidata_id = wikidata_id,
+       lotus_hit = hit, lotus_error = NA_character_)
+}
+
+# ---------------- Main ----------------
+
+input_csv <- pick_input_file()
+df <- read_csv(input_csv, show_col_types = FALSE)
+
+inchikey_col <- find_inchikey_column(df)
+df[[inchikey_col]] <- normalize_inchikey(df[[inchikey_col]])
+
+# Output columns
+out_pathway <- "LOTUS_NPClassifier_Pathway"
+out_superclass <- "LOTUS_NPClassifier_Superclass"
+out_class <- "LOTUS_NPClassifier_Class"
+out_lotus_id <- "LOTUS_lotus_id"
+out_wd_id <- "LOTUS_wikidata_id"
+out_hit <- "LOTUS_hit"
+out_date <- "date_lotus_npclassifier_search"
+out_error <- "LOTUS_error"
+
+n <- nrow(df)
+
+pathway_vec <- rep(NA_character_, n)
+superclass_vec <- rep(NA_character_, n)
+class_vec <- rep(NA_character_, n)
+lotus_id_vec <- rep(NA_character_, n)
+wd_id_vec <- rep(NA_character_, n)
+hit_vec <- rep(FALSE, n)
+err_vec <- rep(NA_character_, n)
+
+sleep_s <- 0.2
+
+cat("Fetching LOTUS NPClassifier (online) for", n, "rows...\n")
+
+for (i in seq_len(n)) {
+  ik <- df[[inchikey_col]][[i]]
+  res <- fetch_lotus_npclassifier_for_inchikey(ik, sleep_s = sleep_s)
+  
+  pathway_vec[[i]] <- res$pathway
+  superclass_vec[[i]] <- res$superclass
+  class_vec[[i]] <- res$class
+  lotus_id_vec[[i]] <- res$lotus_lotus_id
+  wd_id_vec[[i]] <- res$lotus_wikidata_id
+  hit_vec[[i]] <- isTRUE(res$lotus_hit)
+  err_vec[[i]] <- res$lotus_error
+  
+  if (i %% 25 == 0) cat("Processed", i, "/", n, "\n")
+}
+
+df[[out_pathway]] <- pathway_vec
+df[[out_superclass]] <- superclass_vec
+df[[out_class]] <- class_vec
+df[[out_lotus_id]] <- lotus_id_vec
+df[[out_wd_id]] <- wd_id_vec
+df[[out_hit]] <- hit_vec
+df[[out_error]] <- err_vec
+
+# Stamp date when we have a hit (or keep existing values if column already exists)
+if (!(out_date %in% names(df))) df[[out_date]] <- NA_character_
+now_iso <- iso_datetime_now()
+df[[out_date]] <- ifelse(df[[out_hit]], now_iso, df[[out_date]])
+
+# Save next to input
+out_dir <- dirname(input_csv)
+base <- file_path_sans_ext(basename(input_csv))
+out_csv <- file.path(out_dir, paste0(base, "_lotus_npclassifier.csv"))
+
+write_csv(df, out_csv)
+cat("\nDONE. Saved output next to input:\n", out_csv, "\n", sep = "")
