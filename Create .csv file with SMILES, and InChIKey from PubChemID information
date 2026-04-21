@@ -1,0 +1,182 @@
+# =========================
+# PubChem CID -> SMILES + InChIKey (ROBUST, Interactive)
+# - GUI file picker (CSV/XLSX)
+# - Auto-detects pubchemid
+# - Fetches properties from PubChem and parses fields that actually appear:
+#     SMILES, ConnectivitySMILES, CanonicalSMILES, IsomericSMILES, InChIKey
+# - Fills final columns: smiles and inchikey
+# - Saves output CSV in the SAME folder as the input file
+# =========================
+
+suppressPackageStartupMessages({
+  library(httr)
+  library(jsonlite)
+  library(dplyr)
+  library(purrr)
+  library(readr)
+  library(readxl)
+  library(tools)
+})
+
+# ---------- Helpers ----------
+clean_colnames <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\u00A0", " ", x, fixed = TRUE)
+  x <- trimws(x)
+  x <- gsub('^[\\"“”‘’]+|[\\"“”‘’]+$', "", x)
+  trimws(x)
+}
+
+normalize_name <- function(x) {
+  tolower(gsub("[ _\\.\\-\\(\\)\\[\\]\\{\\}/\\\\]+", "", clean_colnames(x)))
+}
+
+# Always return exactly one string
+one_chr <- function(x) {
+  if (is.null(x) || length(x) == 0) return(NA_character_)
+  v <- as.character(x[[1]])
+  if (length(v) == 0) return(NA_character_)
+  v <- v[1]
+  if (is.na(v) || !nzchar(trimws(v))) NA_character_ else v
+}
+
+# Prevent scientific notation in CIDs
+cid_to_string <- function(cid) {
+  if (is.na(cid)) return(NA_character_)
+  s <- format(cid, scientific = FALSE, trim = TRUE, digits = 15)
+  s <- gsub("\\.0+$", "", s)
+  s <- trimws(s)
+  if (!nzchar(s)) NA_character_ else s
+}
+
+# ---------- GUI file picker ----------
+pick_file_gui <- function() {
+  p <- tryCatch(file.choose(), error = function(e) NA_character_)
+  if (!is.na(p) && nzchar(p) && file.exists(p)) return(p)
+  
+  if (requireNamespace("tcltk", quietly = TRUE)) {
+    p2 <- tryCatch(tcltk::tk_choose.files(multi = FALSE), error = function(e) "")
+    p2 <- as.character(p2)
+    if (nzchar(p2) && file.exists(p2)) return(p2)
+  }
+  
+  stop("No GUI file picker available. Use RStudio Desktop / RGui (not Rscript/terminal).")
+}
+
+# ---------- Read input ----------
+read_input_table <- function(path) {
+  ext <- tolower(file_ext(path))
+  if (!ext %in% c("csv", "xlsx")) stop("Unsupported file type. Select .csv or .xlsx")
+  
+  if (ext == "csv") {
+    first_line <- readLines(path, n = 1, warn = FALSE)
+    comma_count  <- lengths(regmatches(first_line, gregexpr(",", first_line)))
+    semicol_count <- lengths(regmatches(first_line, gregexpr(";", first_line)))
+    if (semicol_count > comma_count) {
+      return(read_csv2(path, show_col_types = FALSE))
+    } else {
+      return(read_csv(path, show_col_types = FALSE))
+    }
+  }
+  
+  sheets <- excel_sheets(path)
+  if (length(sheets) == 0) stop("No sheets found in Excel file.")
+  sheet <- if (length(sheets) == 1) sheets[1] else sheets[menu(sheets, title = "Choose sheet")]
+  if (is.na(sheet) || !nzchar(sheet)) stop("No sheet selected.")
+  read_excel(path, sheet = sheet)
+}
+
+# ---------- CID column ----------
+pick_cid_column <- function(df) {
+  names(df) <- clean_colnames(names(df))
+  idx <- which(normalize_name(names(df)) == "pubchemid")
+  if (length(idx) > 0) return(names(df)[idx[1]])
+  
+  pick <- menu(names(df), title = "Select the column that contains PubChem CIDs")
+  if (pick == 0) stop("No CID column selected.")
+  names(df)[pick]
+}
+
+# ---------- PubChem fetch (parses the real fields you observed) ----------
+get_pubchem_smiles_inchikey <- function(cid) {
+  out <- list(
+    smiles = NA_character_,
+    inchikey = NA_character_,
+    smiles_source = NA_character_
+  )
+  
+  cid_str <- cid_to_string(cid)
+  if (is.na(cid_str) || !nzchar(cid_str)) return(out)
+  
+  url <- paste0(
+    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/",
+    cid_str,
+    "/property/SMILES,ConnectivitySMILES,CanonicalSMILES,IsomericSMILES,InChIKey/JSON"
+  )
+  
+  res <- tryCatch(GET(url, user_agent("R httr (PubChem CID lookup)")), error = function(e) NULL)
+  if (is.null(res) || status_code(res) != 200) return(out)
+  
+  txt <- tryCatch(content(res, as = "text", encoding = "UTF-8"), error = function(e) "")
+  parsed <- tryCatch(fromJSON(txt), error = function(e) NULL)
+  if (is.null(parsed)) return(out)
+  
+  props <- tryCatch(parsed$PropertyTable$Properties, error = function(e) NULL)
+  if (is.null(props) || length(props) == 0) return(out)
+  
+  # IMPORTANT: PubChem may return SMILES fields under different names.
+  # Priority order:
+  # 1) CanonicalSMILES
+  # 2) IsomericSMILES
+  # 3) SMILES
+  # 4) ConnectivitySMILES
+  canonical <- if (!is.null(props$CanonicalSMILES)) one_chr(props$CanonicalSMILES) else NA_character_
+  isomeric  <- if (!is.null(props$IsomericSMILES))  one_chr(props$IsomericSMILES)  else NA_character_
+  smiles    <- if (!is.null(props$SMILES))          one_chr(props$SMILES)          else NA_character_
+  conn      <- if (!is.null(props$ConnectivitySMILES)) one_chr(props$ConnectivitySMILES) else NA_character_
+  ikey      <- if (!is.null(props$InChIKey))        one_chr(props$InChIKey)        else NA_character_
+  
+  final_smiles <- canonical
+  src <- "CanonicalSMILES"
+  if (is.na(final_smiles) || !nzchar(final_smiles)) { final_smiles <- isomeric; src <- "IsomericSMILES" }
+  if (is.na(final_smiles) || !nzchar(final_smiles)) { final_smiles <- smiles;   src <- "SMILES" }
+  if (is.na(final_smiles) || !nzchar(final_smiles)) { final_smiles <- conn;     src <- "ConnectivitySMILES" }
+  
+  out$smiles <- if (is.na(final_smiles) || !nzchar(final_smiles)) NA_character_ else final_smiles
+  out$inchikey <- if (is.na(ikey) || !nzchar(ikey)) NA_character_ else ikey
+  out$smiles_source <- if (is.na(out$smiles)) NA_character_ else src
+  out
+}
+
+# =========================
+# RUN
+# =========================
+input_path <- pick_file_gui()
+df <- read_input_table(input_path)
+names(df) <- clean_colnames(names(df))
+cid_col <- pick_cid_column(df)
+
+cat("\nFetching SMILES + InChIKey from PubChem... (may take a while)\n")
+
+res_list <- map(df[[cid_col]], get_pubchem_smiles_inchikey)
+
+df_out <- df %>%
+  mutate(
+    smiles        = map_chr(res_list, "smiles"),
+    inchikey      = map_chr(res_list, "inchikey"),
+    smiles_source = map_chr(res_list, "smiles_source")
+  )
+
+cat("\n✅ Done! Preview:\n")
+print(head(df_out))
+
+out_path <- file.path(
+  dirname(input_path),
+  paste0(file_path_sans_ext(basename(input_path)), "_smiles_inchikey.csv")
+)
+
+write_csv(df_out, out_path)
+cat("\n💾 Saved to:\n", normalizePath(out_path), "\n", sep = "")
+
+df_out
+
