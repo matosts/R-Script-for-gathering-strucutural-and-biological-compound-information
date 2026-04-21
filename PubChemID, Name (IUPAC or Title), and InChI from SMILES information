@@ -1,0 +1,116 @@
+# ============================================================
+# SMILES -> CID, Name (IUPAC or Title), and InChI (Interactive)
+# - Prompts you to pick the input CSV file
+# - Saves the output CSV in the same folder as the input
+# ============================================================
+
+# 1) Install and load packages
+if (!requireNamespace("webchem", quietly = TRUE)) install.packages("webchem")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("purrr", quietly = TRUE)) install.packages("purrr")
+
+library(webchem)
+library(dplyr)
+library(purrr)
+
+# 2) Choose the input file (interactive)
+message("Please select the CSV file that contains your SMILES column...")
+input_path <- file.choose()
+
+# 3) Read the input table
+smiles_df <- read.csv(input_path, stringsAsFactors = FALSE)
+
+# 4) Detect the SMILES column (tries common names; falls back to the first column)
+candidate_cols <- c("SMILES", "smiles", "Smiles", "canonical_smiles", "Canonical_SMILES")
+smiles_col <- intersect(candidate_cols, colnames(smiles_df))
+
+if (length(smiles_col) == 0) {
+  message("SMILES column not found by common names. Using the first column: ", colnames(smiles_df)[1])
+  smiles_col <- colnames(smiles_df)[1]
+} else {
+  smiles_col <- smiles_col[1]
+  message("Using SMILES column: ", smiles_col)
+}
+
+smiles_list <- smiles_df[[smiles_col]]
+
+# 5) Helper function: SMILES -> CID, Name, InChI
+get_cid_name_inchi <- function(smiles) {
+  message("Processing: ", smiles)
+  Sys.sleep(0.1) # gentle pacing for the service
+  
+  # 5.1 Get CID from SMILES
+  cid_data <- tryCatch(
+    get_cid(smiles, from = "smiles"),
+    error = function(e) {
+      message("get_cid error for: ", smiles, " | ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(cid_data) || !is.data.frame(cid_data) || nrow(cid_data) == 0) {
+    return(data.frame(
+      SMILES = smiles, CID = NA, Name = NA, InChI = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  cid <- cid_data$cid[1]
+  name <- NA_character_
+  inchi <- NA_character_
+  
+  # 5.2 Get properties (IUPACName and InChI)
+  prop_data <- tryCatch(
+    pc_prop(cid, properties = c("IUPACName", "InChI")),
+    error = function(e) {
+      message("pc_prop error for CID: ", cid, " | ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (!is.null(prop_data) && is.data.frame(prop_data) && nrow(prop_data) > 0) {
+    if ("IUPACName" %in% colnames(prop_data) && !is.na(prop_data$IUPACName[1]) && prop_data$IUPACName[1] != "") {
+      name <- prop_data$IUPACName[1]
+    }
+    if ("InChI" %in% colnames(prop_data) && !is.na(prop_data$InChI[1]) && prop_data$InChI[1] != "") {
+      inchi <- prop_data$InChI[1]
+    }
+  }
+  
+  # 5.3 If name is still missing, try compound title
+  if (is.na(name) || name == "") {
+    compound_data <- tryCatch(
+      pc_compound(cid),
+      error = function(e) {
+        message("pc_compound error for CID: ", cid, " | ", e$message)
+        return(NULL)
+      }
+    )
+    
+    if (!is.null(compound_data) && "title" %in% names(compound_data) && !is.null(compound_data$title) && compound_data$title != "") {
+      name <- compound_data$title
+    }
+  }
+  
+  data.frame(
+    SMILES = smiles,
+    CID = cid,
+    Name = name,
+    InChI = inchi,
+    stringsAsFactors = FALSE
+  )
+}
+
+# 6) Run for all SMILES
+results <- map_dfr(smiles_list, get_cid_name_inchi)
+
+# 7) Save output in the same folder as the input
+out_dir <- dirname(input_path)
+in_base <- tools::file_path_sans_ext(basename(input_path))
+output_path <- file.path(out_dir, paste0(in_base, "_with_CID_Name_InChI.csv"))
+
+write.csv(results, output_path, row.names = FALSE)
+
+# 8) Show where it was saved + preview
+message("Done! Output saved to: ", output_path)
+print(head(results))
